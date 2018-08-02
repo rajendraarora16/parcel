@@ -1,39 +1,36 @@
 const assert = require('assert');
-const fs = require('fs');
+const fs = require('../src/utils/fs');
 const path = require('path');
-const {bundler, run, sleep} = require('./utils');
-const rimraf = require('rimraf');
-const promisify = require('../src/utils/promisify');
-const ncp = promisify(require('ncp'));
+const {bundler, run, sleep, rimraf, ncp} = require('./utils');
 const WebSocket = require('ws');
 const json5 = require('json5');
 const sinon = require('sinon');
 
 describe('hmr', function() {
-  let b, ws;
-  beforeEach(function() {
-    rimraf.sync(__dirname + '/input');
+  let b, ws, stub;
+  beforeEach(async function() {
+    stub = sinon.stub(console, 'clear');
+    await rimraf(__dirname + '/input');
   });
 
-  afterEach(function(done) {
-    let finalise = () => {
+  afterEach(async function() {
+    stub.restore();
+    let finalise = async () => {
       if (b) {
-        b.stop();
+        await b.stop();
         b = null;
-
-        done();
       }
     };
 
     if (ws) {
       ws.close();
-      ws.onclose = () => {
-        ws = null;
-        finalise();
-      };
-    } else {
-      finalise();
+      await new Promise(resolve => {
+        ws.onclose = resolve;
+      });
+      ws = null;
     }
+
+    await finalise();
   });
 
   function nextEvent(emitter, event) {
@@ -52,7 +49,11 @@ describe('hmr', function() {
 
     const buildEnd = nextEvent(b, 'buildEnd');
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'exports.a = 5;\nexports.b = 5;'
     );
@@ -97,7 +98,11 @@ describe('hmr', function() {
 
     const buildEnd = nextEvent(b, 'buildEnd');
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'exports.a = 5; exports.b = 5;'
     );
@@ -121,7 +126,11 @@ describe('hmr', function() {
 
     const buildEnd = nextEvent(b, 'buildEnd');
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'require("fs"); exports.a = 5; exports.b = 5;'
     );
@@ -143,7 +152,11 @@ describe('hmr', function() {
 
     const buildEnd = nextEvent(b, 'buildEnd');
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'require("fs"; exports.a = 5; exports.b = 5;'
     );
@@ -171,7 +184,11 @@ describe('hmr', function() {
     b = bundler(__dirname + '/input/index.js', {watch: true, hmr: true});
     await b.bundle();
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'require("fs"; exports.a = 5; exports.b = 5;'
     );
@@ -193,7 +210,11 @@ describe('hmr', function() {
 
     const firstBuildEnd = nextEvent(b, 'buildEnd');
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'require("fs"; exports.a = 5; exports.b = 5;'
     );
@@ -205,7 +226,7 @@ describe('hmr', function() {
 
     const secondBuildEnd = nextEvent(b, 'buildEnd');
 
-    fs.writeFileSync(
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'require("fs"); exports.a = 5; exports.b = 5;'
     );
@@ -223,7 +244,7 @@ describe('hmr', function() {
     let bundle = await b.bundle();
     let outputs = [];
 
-    run(bundle, {
+    await run(bundle, {
       output(o) {
         outputs.push(o);
       }
@@ -231,7 +252,11 @@ describe('hmr', function() {
 
     assert.deepEqual(outputs, [3]);
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'exports.a = 5; exports.b = 5;'
     );
@@ -248,7 +273,7 @@ describe('hmr', function() {
     let outputs = [];
     let moduleId = '';
 
-    run(bundle, {
+    await run(bundle, {
       reportModuleId(id) {
         moduleId = id;
       },
@@ -259,7 +284,11 @@ describe('hmr', function() {
 
     assert.deepEqual(outputs, [3]);
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'exports.a = 5; exports.b = 5;'
     );
@@ -281,7 +310,7 @@ describe('hmr', function() {
     let bundle = await b.bundle();
     let outputs = [];
 
-    run(bundle, {
+    await run(bundle, {
       output(o) {
         outputs.push(o);
       }
@@ -290,7 +319,11 @@ describe('hmr', function() {
     await sleep(50);
     assert.deepEqual(outputs, [3]);
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'exports.a = 5; exports.b = 5;'
     );
@@ -307,13 +340,14 @@ describe('hmr', function() {
     let bundle = await b.bundle();
 
     let logs = [];
-    let ctx = run(
+    let ctx = await run(
       bundle,
       {
         console: {
           error(msg) {
             logs.push(msg);
-          }
+          },
+          clear() {}
         }
       },
       {require: false}
@@ -321,7 +355,11 @@ describe('hmr', function() {
 
     let spy = sinon.spy(ctx.document.body, 'appendChild');
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'require("fs"; exports.a = 5; exports.b = 5;'
     );
@@ -340,7 +378,7 @@ describe('hmr', function() {
     let bundle = await b.bundle();
 
     let logs = [];
-    let ctx = run(
+    let ctx = await run(
       bundle,
       {
         console: {
@@ -349,7 +387,8 @@ describe('hmr', function() {
           },
           log(msg) {
             logs.push(msg);
-          }
+          },
+          clear() {}
         }
       },
       {require: false}
@@ -358,7 +397,11 @@ describe('hmr', function() {
     let appendSpy = sinon.spy(ctx.document.body, 'appendChild');
     let removeSpy = sinon.spy(ctx.document.getElementById('tmp'), 'remove');
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'require("fs"; exports.a = 5; exports.b = 5;'
     );
@@ -367,7 +410,7 @@ describe('hmr', function() {
 
     assert(appendSpy.called);
 
-    fs.writeFileSync(
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'require("fs"); exports.a = 5; exports.b = 5;'
     );
@@ -397,7 +440,11 @@ describe('hmr', function() {
 
     const buildEnd = nextEvent(b, 'buildEnd');
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'exports.a = 5;\nexports.b = 5;'
     );
@@ -430,7 +477,11 @@ describe('hmr', function() {
 
     const buildEnd = nextEvent(b, 'buildEnd');
 
-    fs.writeFileSync(
+    if (process.platform === 'win32') {
+      await sleep(100);
+    }
+
+    await fs.writeFile(
       __dirname + '/input/local.js',
       'exports.a = 5;\nexports.b = 5;'
     );

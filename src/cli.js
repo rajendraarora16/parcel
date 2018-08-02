@@ -6,7 +6,7 @@ const version = require('../package.json').version;
 program.version(version);
 
 program
-  .command('serve [input]')
+  .command('serve [input...]')
   .description('starts a development server')
   .option(
     '-p, --port <port>',
@@ -41,6 +41,7 @@ program
     '--public-url <url>',
     'set the public URL to serve on. defaults to the same as the --out-dir option'
   )
+  .option('--global <variable>', 'expose your module through a global variable')
   .option('--no-hmr', 'disable hot module replacement')
   .option('--no-cache', 'disable the filesystem cache')
   .option('--no-source-maps', 'disable sourcemaps')
@@ -50,16 +51,21 @@ program
     'set the runtime environment, either "node", "browser" or "electron". defaults to "browser"',
     /^(node|browser|electron)$/
   )
+  .option(
+    '--bundle-node-modules',
+    'force bundling node modules, even on node/electron target'
+  )
   .option('-V, --version', 'output the version number')
   .option(
     '--log-level <level>',
     'set the log level, either "0" (no output), "1" (errors), "2" (warnings + errors) or "3" (all).',
     /^([0-3])$/
   )
+  .option('--cache-dir <path>', 'set the cache directory. defaults to ".cache"')
   .action(bundle);
 
 program
-  .command('watch [input]')
+  .command('watch [input...]')
   .description('starts the bundler in watch mode')
   .option(
     '-d, --out-dir <path>',
@@ -73,6 +79,7 @@ program
     '--public-url <url>',
     'set the public URL to serve on. defaults to the same as the --out-dir option'
   )
+  .option('--global <variable>', 'expose your module through a global variable')
   .option(
     '--hmr-port <port>',
     'set the port to serve HMR websockets, defaults to random',
@@ -82,6 +89,9 @@ program
     '--hmr-hostname <hostname>',
     'set the hostname of HMR websockets, defaults to location.hostname of current window'
   )
+  .option('--https', 'listen on HTTPS for HMR connections')
+  .option('--cert <path>', 'path to certificate to use with HTTPS')
+  .option('--key <path>', 'path to private key to use with HTTPS')
   .option('--no-hmr', 'disable hot module replacement')
   .option('--no-cache', 'disable the filesystem cache')
   .option('--no-source-maps', 'disable sourcemaps')
@@ -92,14 +102,19 @@ program
     /^(node|browser|electron)$/
   )
   .option(
+    '--bundle-node-modules',
+    'force bundling node modules, even on node/electron target'
+  )
+  .option(
     '--log-level <level>',
     'set the log level, either "0" (no output), "1" (errors), "2" (warnings + errors) or "3" (all).',
     /^([0-3])$/
   )
+  .option('--cache-dir <path>', 'set the cache directory. defaults to ".cache"')
   .action(bundle);
 
 program
-  .command('build [input]')
+  .command('build [input...]')
   .description('bundles for production')
   .option(
     '-d, --out-dir <path>',
@@ -113,13 +128,22 @@ program
     '--public-url <url>',
     'set the public URL to serve on. defaults to the same as the --out-dir option'
   )
+  .option('--global <variable>', 'expose your module through a global variable')
   .option('--no-minify', 'disable minification')
   .option('--no-cache', 'disable the filesystem cache')
   .option('--no-source-maps', 'disable sourcemaps')
   .option(
+    '--experimental-scope-hoisting',
+    'enable experimental scope hoisting/tree shaking support'
+  )
+  .option(
     '-t, --target <target>',
     'set the runtime environment, either "node", "browser" or "electron". defaults to "browser"',
     /^(node|browser|electron)$/
+  )
+  .option(
+    '--bundle-node-modules',
+    'force bundling node modules, even on node/electron target'
   )
   .option(
     '--detailed-report',
@@ -130,6 +154,7 @@ program
     'set the log level, either "0" (no output), "1" (errors), "2" (warnings + errors) or "3" (all).',
     /^([0-3])$/
   )
+  .option('--cache-dir <path>', 'set the cache directory. defaults to ".cache"')
   .action(bundle);
 
 program
@@ -164,7 +189,8 @@ async function bundle(main, command) {
   const Bundler = require('../');
 
   if (command.name() === 'build') {
-    process.env.NODE_ENV = 'production';
+    command.production = true;
+    process.env.NODE_ENV = process.env.NODE_ENV || 'production';
   } else {
     process.env.NODE_ENV = process.env.NODE_ENV || 'development';
   }
@@ -176,11 +202,13 @@ async function bundle(main, command) {
     };
   }
 
+  command.scopeHoist = command.experimentalScopeHoisting || false;
   const bundler = new Bundler(main, command);
 
-  if (command.name() === 'serve') {
+  command.target = command.target || 'browser';
+  if (command.name() === 'serve' && command.target === 'browser') {
     const server = await bundler.serve(command.port || 1234, command.https);
-    if (command.open) {
+    if (server && command.open) {
       await require('./utils/openInBrowser')(
         `${command.https ? 'https' : 'http'}://localhost:${
           server.address().port

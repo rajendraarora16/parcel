@@ -7,27 +7,36 @@ const Asset = require('../Asset');
 const babylon = require('babylon');
 const insertGlobals = require('../visitors/globals');
 const fsVisitor = require('../visitors/fs');
+const envVisitor = require('../visitors/env');
 const babel = require('../transforms/babel');
 const generate = require('babel-generator').default;
-const uglify = require('../transforms/uglify');
+const terser = require('../transforms/terser');
 const SourceMap = require('../SourceMap');
+const hoist = require('../scope-hoisting/hoist');
+const path = require('path');
+const fs = require('../utils/fs');
+const logger = require('../Logger');
 
 const IMPORT_RE = /\b(?:import\b|export\b|require\s*\()/;
-const GLOBAL_RE = /\b(?:process|__dirname|__filename|global|Buffer)\b/;
+const ENV_RE = /\b(?:process\.env)\b/;
+const GLOBAL_RE = /\b(?:process|__dirname|__filename|global|Buffer|define)\b/;
 const FS_RE = /\breadFileSync\b/;
 const SW_RE = /\bnavigator\s*\.\s*serviceWorker\s*\.\s*register\s*\(/;
 const WORKER_RE = /\bnew\s*Worker\s*\(/;
+const SOURCEMAP_RE = /\/\/\s*[@#]\s*sourceMappingURL\s*=\s*([^\s]+)/;
+const DATA_URL_RE = /^data:[^;]+(?:;charset=[^;]+)?;base64,(.*)/;
 
 class JSAsset extends Asset {
-  constructor(name, pkg, options) {
-    super(name, pkg, options);
+  constructor(name, options) {
+    super(name, options);
     this.type = 'js';
     this.globals = new Map();
     this.isAstDirty = false;
     this.isES6Module = false;
     this.outputCode = null;
     this.cacheData.env = {};
-    this.sourceMap = options.rendition ? options.rendition.sourceMap : null;
+    this.rendition = options.rendition;
+    this.sourceMap = this.rendition ? this.rendition.sourceMap : null;
   }
 
   shouldInvalidate(cacheData) {
@@ -80,6 +89,15 @@ class JSAsset extends Asset {
   }
 
   traverse(visitor) {
+    // Create a babel File object if one hasn't been created yet.
+    // This is needed so that cached NodePath objects get a `hub` object on them.
+    // Plugins like babel-minify depend on this to get the original source code string.
+    if (!this.babelFile) {
+      this.babelFile = new BabelFile(this.babelConfig || {});
+      this.babelFile.addCode(this.contents);
+      this.babelFile.addAst(this.ast);
+    }
+
     return traverse(this.ast, visitor, null, this);
   }
 
@@ -91,15 +109,95 @@ class JSAsset extends Asset {
     walk.ancestor(this.ast, collectDependencies, this);
   }
 
+  async loadSourceMap() {
+    // Get original sourcemap if there is any
+    let match = this.contents.match(SOURCEMAP_RE);
+    if (match) {
+      this.contents = this.contents.replace(SOURCEMAP_RE, '');
+
+      let url = match[1];
+      let dataURLMatch = url.match(DATA_URL_RE);
+
+      try {
+        let json, filename;
+        if (dataURLMatch) {
+          filename = this.name;
+          json = new Buffer(dataURLMatch[1], 'base64').toString();
+        } else {
+          filename = path.join(path.dirname(this.name), url);
+          json = await fs.readFile(filename, 'utf8');
+
+          // Add as a dep so we watch the source map for changes.
+          this.addDependency(filename, {includedInParent: true});
+        }
+
+        this.sourceMap = JSON.parse(json);
+
+        // Attempt to read missing source contents
+        if (!this.sourceMap.sourcesContent) {
+          this.sourceMap.sourcesContent = [];
+        }
+
+        let missingSources = this.sourceMap.sources.slice(
+          this.sourceMap.sourcesContent.length
+        );
+        if (missingSources.length) {
+          let contents = await Promise.all(
+            missingSources.map(async source => {
+              try {
+                let sourceFile = path.join(
+                  path.dirname(filename),
+                  this.sourceMap.sourceRoot || '',
+                  source
+                );
+                let result = await fs.readFile(sourceFile, 'utf8');
+                this.addDependency(sourceFile, {includedInParent: true});
+                return result;
+              } catch (err) {
+                logger.warn(
+                  `Could not load source file "${source}" in source map of "${
+                    this.relativeName
+                  }".`
+                );
+              }
+            })
+          );
+
+          this.sourceMap.sourcesContent = this.sourceMap.sourcesContent.concat(
+            contents
+          );
+        }
+      } catch (e) {
+        logger.warn(
+          `Could not load existing sourcemap of "${this.relativeName}".`
+        );
+      }
+    }
+  }
+
   async pretransform() {
+    await this.loadSourceMap();
     await babel(this);
+
+    // Inline environment variables
+    if (this.options.target === 'browser' && ENV_RE.test(this.contents)) {
+      await this.parseIfNeeded();
+      this.traverseFast(envVisitor);
+    }
   }
 
   async transform() {
     if (this.options.target === 'browser') {
       if (this.dependencies.has('fs') && FS_RE.test(this.contents)) {
-        await this.parseIfNeeded();
-        this.traverse(fsVisitor);
+        // Check if we should ignore fs calls
+        // See https://github.com/defunctzombie/node-browser-resolve#skip
+        let pkg = await this.getPackage();
+        let ignore = pkg && pkg.browser && pkg.browser.fs === false;
+
+        if (!ignore) {
+          await this.parseIfNeeded();
+          this.traverse(fsVisitor);
+        }
       }
 
       if (GLOBAL_RE.test(this.contents)) {
@@ -108,16 +206,27 @@ class JSAsset extends Asset {
       }
     }
 
-    if (this.isES6Module) {
-      await babel(this);
+    if (this.options.scopeHoist) {
+      await this.parseIfNeeded();
+      await this.getPackage();
+
+      this.traverse(hoist);
+      this.isAstDirty = true;
+    } else {
+      if (this.isES6Module) {
+        await babel(this);
+      }
     }
 
     if (this.options.minify) {
-      await uglify(this);
+      await terser(this);
     }
   }
 
   async generate() {
+    let enableSourceMaps =
+      this.options.sourceMaps &&
+      (!this.rendition || !!this.rendition.sourceMap);
     let code;
     if (this.isAstDirty) {
       let opts = {
@@ -127,7 +236,7 @@ class JSAsset extends Asset {
 
       let generated = generate(this.ast, opts, this.contents);
 
-      if (this.options.sourceMaps && generated.rawMappings) {
+      if (enableSourceMaps && generated.rawMappings) {
         let rawMap = new SourceMap(generated.rawMappings, {
           [this.relativeName]: this.contents
         });
@@ -146,10 +255,10 @@ class JSAsset extends Asset {
 
       code = generated.code;
     } else {
-      code = this.outputCode || this.contents;
+      code = this.outputCode != null ? this.outputCode : this.contents;
     }
 
-    if (this.options.sourceMaps && !this.sourceMap) {
+    if (enableSourceMaps && !this.sourceMap) {
       this.sourceMap = new SourceMap().generateEmptyMap(
         this.relativeName,
         this.contents
@@ -158,7 +267,7 @@ class JSAsset extends Asset {
 
     if (this.globals.size > 0) {
       code = Array.from(this.globals.values()).join('\n') + '\n' + code;
-      if (this.options.sourceMaps) {
+      if (enableSourceMaps) {
         if (!(this.sourceMap instanceof SourceMap)) {
           this.sourceMap = await new SourceMap().addMap(this.sourceMap);
         }

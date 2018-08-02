@@ -1,12 +1,14 @@
 const URL = require('url');
 const path = require('path');
+const clone = require('clone');
 const fs = require('./utils/fs');
 const objectHash = require('./utils/objectHash');
 const md5 = require('./utils/md5');
 const isURL = require('./utils/is-url');
 const config = require('./utils/config');
-
-let ASSET_ID = 1;
+const syncPromise = require('./utils/syncPromise');
+const logger = require('./Logger');
+const Resolver = require('./Resolver');
 
 /**
  * An Asset represents a file in the dependency tree. Assets can have multiple
@@ -15,12 +17,11 @@ let ASSET_ID = 1;
  * for subclasses to implement.
  */
 class Asset {
-  constructor(name, pkg, options) {
-    this.id = ASSET_ID++;
+  constructor(name, options) {
+    this.id = null;
     this.name = name;
     this.basename = path.basename(this.name);
     this.relativeName = path.relative(options.rootDir, this.name);
-    this.package = pkg || {};
     this.options = options;
     this.encoding = 'utf8';
     this.type = path.extname(this.name).slice(1);
@@ -36,8 +37,11 @@ class Asset {
     this.parentBundle = null;
     this.bundles = new Set();
     this.cacheData = {};
+    this.startTime = 0;
+    this.endTime = 0;
     this.buildTime = 0;
     this.bundledSize = 0;
+    this.resolver = new Resolver(options);
   }
 
   shouldInvalidate() {
@@ -88,20 +92,53 @@ class Asset {
     }
 
     const parsed = URL.parse(url);
-    const resolved = path.resolve(path.dirname(from), parsed.pathname);
-    this.addDependency(
-      './' + path.relative(path.dirname(this.name), resolved),
-      Object.assign({dynamic: true}, opts)
-    );
+    let depName;
+    let resolved;
+    let dir = path.dirname(from);
+    const filename = decodeURIComponent(parsed.pathname);
+
+    if (filename[0] === '~' || filename[0] === '/') {
+      if (dir === '.') {
+        dir = this.options.rootDir;
+      }
+      depName = resolved = this.resolver.resolveFilename(filename, dir);
+    } else {
+      resolved = path.resolve(dir, filename);
+      depName = './' + path.relative(path.dirname(this.name), resolved);
+    }
+
+    this.addDependency(depName, Object.assign({dynamic: true}, opts));
 
     parsed.pathname = this.options.parser
-      .getAsset(resolved, this.package, this.options)
+      .getAsset(resolved, this.options)
       .generateBundleName();
 
     return URL.format(parsed);
   }
 
+  get package() {
+    logger.warn(
+      '`asset.package` is deprecated. Please use `await asset.getPackage()` instead.'
+    );
+    return syncPromise(this.getPackage());
+  }
+
+  async getPackage() {
+    if (!this._package) {
+      this._package = await this.resolver.findPackage(path.dirname(this.name));
+    }
+
+    return this._package;
+  }
+
   async getConfig(filenames, opts = {}) {
+    if (opts.packageKey) {
+      let pkg = await this.getPackage();
+      if (pkg && pkg[opts.packageKey]) {
+        return clone(pkg[opts.packageKey]);
+      }
+    }
+
     // Resolve the config file
     let conf = await config.resolve(opts.path || this.name, filenames);
     if (conf) {
@@ -149,6 +186,17 @@ class Asset {
   }
 
   async process() {
+    // Generate the id for this asset, unless it has already been set.
+    // We do this here rather than in the constructor to avoid unnecessary work in the main process.
+    // In development, the id is just the relative path to the file, for easy debugging and performance.
+    // In production, we use a short hash of the relative path.
+    if (!this.id) {
+      this.id =
+        this.options.production || this.options.scopeHoist
+          ? md5(this.relativeName, 'base64').slice(0, 4)
+          : this.relativeName;
+    }
+
     if (!this.generated) {
       await this.loadIfNeeded();
       await this.pretransform();
@@ -192,15 +240,23 @@ class Asset {
   }
 
   replaceBundleNames(bundleNameMap) {
+    let copied = false;
     for (let key in this.generated) {
       let value = this.generated[key];
       if (typeof value === 'string') {
         // Replace temporary bundle names in the output with the final content-hashed names.
+        let newValue = value;
         for (let [name, map] of bundleNameMap) {
-          value = value.split(name).join(map);
+          newValue = newValue.split(name).join(map);
         }
 
-        this.generated[key] = value;
+        // Copy `this.generated` on write so we don't end up writing the final names to the cache.
+        if (newValue !== value && !copied) {
+          this.generated = Object.assign({}, this.generated);
+          copied = true;
+        }
+
+        this.generated[key] = newValue;
       }
     }
   }

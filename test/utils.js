@@ -1,11 +1,15 @@
 const Bundler = require('../src/Bundler');
-const rimraf = require('rimraf');
 const assert = require('assert');
 const vm = require('vm');
-const fs = require('fs');
+const fs = require('../src/utils/fs');
+const nodeFS = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
 const Module = require('module');
+
+const promisify = require('../src/utils/promisify');
+const rimraf = promisify(require('rimraf'));
+const ncp = promisify(require('ncp'));
 
 beforeEach(async function() {
   // Test run in a single process, creating and deleting the same file(s)
@@ -16,7 +20,7 @@ beforeEach(async function() {
   }
   // Unix based systems also need a delay but only half as much as windows
   await sleep(50);
-  rimraf.sync(path.join(__dirname, 'dist'));
+  await rimraf(path.join(__dirname, 'dist'));
 });
 
 function sleep(ms) {
@@ -62,7 +66,7 @@ function prepareBrowserContext(bundle, globals) {
             setTimeout(function() {
               if (el.tag === 'script') {
                 vm.runInContext(
-                  fs.readFileSync(path.join(__dirname, 'dist', el.src)),
+                  nodeFS.readFileSync(path.join(__dirname, 'dist', el.src)),
                   ctx
                 );
               }
@@ -85,8 +89,11 @@ function prepareBrowserContext(bundle, globals) {
     }
   };
 
+  var exports = {};
   var ctx = Object.assign(
     {
+      exports,
+      module: {exports},
       document: fakeDocument,
       WebSocket,
       console,
@@ -95,8 +102,14 @@ function prepareBrowserContext(bundle, globals) {
         return Promise.resolve({
           arrayBuffer() {
             return Promise.resolve(
-              new Uint8Array(fs.readFileSync(path.join(__dirname, 'dist', url)))
-                .buffer
+              new Uint8Array(
+                nodeFS.readFileSync(path.join(__dirname, 'dist', url))
+              ).buffer
+            );
+          },
+          text() {
+            return Promise.resolve(
+              nodeFS.readFileSync(path.join(__dirname, 'dist', url), 'utf8')
             );
           }
         });
@@ -116,6 +129,7 @@ function prepareNodeContext(bundle, globals) {
   var ctx = Object.assign(
     {
       module: mod,
+      exports: module.exports,
       __filename: bundle.name,
       __dirname: path.dirname(bundle.name),
       require: function(path) {
@@ -133,7 +147,7 @@ function prepareNodeContext(bundle, globals) {
   return ctx;
 }
 
-function run(bundle, globals, opts = {}) {
+async function run(bundle, globals, opts = {}) {
   var ctx;
   switch (bundle.entryAsset.options.target) {
     case 'browser':
@@ -151,22 +165,37 @@ function run(bundle, globals, opts = {}) {
   }
 
   vm.createContext(ctx);
-  vm.runInContext(fs.readFileSync(bundle.name), ctx);
+  vm.runInContext(await fs.readFile(bundle.name), ctx);
 
   if (opts.require !== false) {
-    return ctx.parcelRequire(bundle.entryAsset.id);
+    if (ctx.parcelRequire) {
+      return ctx.parcelRequire(bundle.entryAsset.id);
+    } else if (ctx.output) {
+      return ctx.output;
+    }
+    if (ctx.module) {
+      return ctx.module.exports;
+    }
   }
 
   return ctx;
 }
 
-function assertBundleTree(bundle, tree) {
+async function assertBundleTree(bundle, tree) {
   if (tree.name) {
-    assert.equal(path.basename(bundle.name), tree.name);
+    assert.equal(
+      path.basename(bundle.name),
+      tree.name,
+      'bundle names mismatched'
+    );
   }
 
   if (tree.type) {
-    assert.equal(bundle.type.toLowerCase(), tree.type.toLowerCase());
+    assert.equal(
+      bundle.type.toLowerCase(),
+      tree.type.toLowerCase(),
+      'bundle types mismatched'
+    );
   }
 
   if (tree.assets) {
@@ -178,7 +207,8 @@ function assertBundleTree(bundle, tree) {
     );
   }
 
-  if (tree.childBundles) {
+  let childBundles = Array.isArray(tree) ? tree : tree.childBundles;
+  if (childBundles) {
     let children = Array.from(bundle.childBundles).sort(
       (a, b) =>
         Array.from(a.assets).sort()[0].basename <
@@ -186,12 +216,18 @@ function assertBundleTree(bundle, tree) {
           ? -1
           : 1
     );
-    assert.equal(bundle.childBundles.size, tree.childBundles.length);
-    tree.childBundles.forEach((b, i) => assertBundleTree(children[i], b));
+    assert.equal(
+      bundle.childBundles.size,
+      childBundles.length,
+      'expected number of child bundles mismatched'
+    );
+    await Promise.all(
+      childBundles.map((b, i) => assertBundleTree(children[i], b))
+    );
   }
 
   if (/js|css/.test(bundle.type)) {
-    assert(fs.existsSync(bundle.name));
+    assert(await fs.exists(bundle.name), 'expected file does not exist');
   }
 }
 
@@ -221,3 +257,5 @@ exports.run = run;
 exports.assertBundleTree = assertBundleTree;
 exports.nextBundle = nextBundle;
 exports.deferred = deferred;
+exports.rimraf = rimraf;
+exports.ncp = ncp;
