@@ -1,7 +1,7 @@
 const builtins = require('./builtins');
 const nodeBuiltins = require('node-libs-browser');
 const path = require('path');
-const isGlob = require('is-glob');
+const {isGlob} = require('./utils/glob');
 const fs = require('./utils/fs');
 const micromatch = require('micromatch');
 
@@ -132,6 +132,11 @@ class Resolver {
           path.basename(path.dirname(dir)) !== 'node_modules'
         ) {
           dir = path.dirname(dir);
+
+          if (dir === path.dirname(dir)) {
+            dir = this.options.rootDir;
+            break;
+          }
         }
 
         return path.join(dir, filename.slice(1));
@@ -142,7 +147,7 @@ class Resolver {
 
       default:
         // Module
-        return path.normalize(filename);
+        return filename;
     }
   }
 
